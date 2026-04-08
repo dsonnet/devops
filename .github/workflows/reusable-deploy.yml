@@ -1,0 +1,124 @@
+name: Reusable Deploy Pipeline
+on:
+  workflow_call:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Read manifest
+        id: manifest
+        run: |
+          echo "app=$(yq '.app' deploy.yml)"                   >> $GITHUB_OUTPUT
+          echo "subdomain=$(yq '.subdomain' deploy.yml)"       >> $GITHUB_OUTPUT
+          echo "port=$(yq '.internal_port' deploy.yml)"        >> $GITHUB_OUTPUT
+          echo "cf_mode=$(yq '.cloudflare_mode' deploy.yml)"   >> $GITHUB_OUTPUT
+
+      - name: Build & push image to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          IMAGE="ghcr.io/Smartoys/${{ steps.manifest.outputs.app }}:latest"
+          docker build -t $IMAGE .
+          docker push $IMAGE
+
+      - name: Cloudflare — DNS mode
+        if: steps.manifest.outputs.cf_mode == 'dns'
+        run: |
+          ZONE="${{ secrets.CF_ZONE_ID }}"
+          TOKEN="${{ secrets.CF_API_TOKEN }}"
+          NAME="${{ steps.manifest.outputs.subdomain }}"
+          IP="${{ secrets.SERVER_PUBLIC_IP }}"
+
+          RECORD_ID=$(curl -s \
+            "https://api.cloudflare.com/client/v4/zones/$ZONE/dns_records?name=$NAME&type=A" \
+            -H "Authorization: Bearer $TOKEN" | jq -r '.result[0].id // empty')
+
+          if [[ -n "$RECORD_ID" ]]; then
+            curl -s -X PUT \
+              "https://api.cloudflare.com/client/v4/zones/$ZONE/dns_records/$RECORD_ID" \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"type\":\"A\",\"name\":\"$NAME\",\"content\":\"$IP\",\"proxied\":true}"
+          else
+            curl -s -X POST \
+              "https://api.cloudflare.com/client/v4/zones/$ZONE/dns_records" \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"type\":\"A\",\"name\":\"$NAME\",\"content\":\"$IP\",\"proxied\":true}"
+          fi
+
+      - name: Cloudflare — Tunnel mode
+        if: steps.manifest.outputs.cf_mode == 'tunnel'
+        env:
+          CF_API_TOKEN:  ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_TUNNEL_ID:  ${{ secrets.CF_TUNNEL_ID }}
+          SUBDOMAIN:     ${{ steps.manifest.outputs.subdomain }}
+        run: |
+          pip install requests --quiet
+          python3 - <<'EOF'
+          import os, requests
+
+          token   = os.environ["CF_API_TOKEN"]
+          account = os.environ["CF_ACCOUNT_ID"]
+          tunnel  = os.environ["CF_TUNNEL_ID"]
+          host    = os.environ["SUBDOMAIN"]
+          service = "http://traefik:80"
+
+          base    = f"https://api.cloudflare.com/client/v4/accounts/{account}/cfd_tunnel/{tunnel}/configurations"
+          headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+          r = requests.get(base, headers=headers)
+          r.raise_for_status()
+          config  = r.json()["result"]["config"]
+          ingress = config.get("ingress", [])
+
+          catch_all = [i for i in ingress if "hostname" not in i]
+          others    = [i for i in ingress if i.get("hostname") and i["hostname"] != host]
+          new_rule  = {"hostname": host, "service": service}
+          new_ingress = [new_rule] + others + catch_all
+
+          r2 = requests.put(base, headers=headers,
+               json={"config": {**config, "ingress": new_ingress}})
+          r2.raise_for_status()
+          print(f"Tunnel ingress updated: {host} -> {service}")
+          EOF
+
+      - name: Install cloudflared
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb \
+            -o cloudflared.deb
+          sudo dpkg -i cloudflared.deb
+
+      - name: Deploy via SSH
+        env:
+          APP:        ${{ steps.manifest.outputs.app }}
+          IMAGE:      "ghcr.io/Smartoys/${{ steps.manifest.outputs.app }}:latest"
+          SUBDOMAIN:  ${{ steps.manifest.outputs.subdomain }}
+          PORT:       ${{ steps.manifest.outputs.port }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_ed25519
+          chmod 600 ~/.ssh/deploy_ed25519
+
+          cat > ~/.ssh/config <<EOF
+          Host ${{ secrets.DEPLOY_HOST }}
+            ProxyCommand cloudflared access ssh --hostname %h
+            StrictHostKeyChecking no
+            IdentityFile ~/.ssh/deploy_ed25519
+            SendEnv APP IMAGE SUBDOMAIN PORT GHCR_TOKEN
+          EOF
+
+          ssh deploy@${{ secrets.DEPLOY_HOST }}
