@@ -72,7 +72,6 @@ log "Deploy started: app=$APP image=$IMAGE subdomain=$SUBDOMAIN port=$PORT"
 
 TMPFILE=$(mktemp "$STACK_DIR/.docker-compose.XXXXXX")
 cat > "$TMPFILE" <<EOF
-version: "3.8"
 services:
   app:
     image: ${IMAGE}
@@ -82,9 +81,7 @@ services:
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.${APP}.rule=Host(\`${SUBDOMAIN}\`)"
-      - "traefik.http.routers.${APP}.entrypoints=websecure"
-      - "traefik.http.routers.${APP}.tls.certresolver=letsencrypt"
-      - "traefik.http.services.${APP}.loadbalancer.server.port=${PORT}"
+      - "traefik.http.routers.${APP}.entrypoints=web"
 networks:
   traefik:
     external: true
