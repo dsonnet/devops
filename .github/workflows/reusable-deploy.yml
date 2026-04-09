@@ -64,6 +64,7 @@ jobs:
           CF_API_TOKEN:  ${{ secrets.CF_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_TUNNEL_ID:  ${{ secrets.CF_TUNNEL_ID }}
+          CF_ZONE_ID:    ${{ secrets.CF_ZONE_ID }}
           SUBDOMAIN:     ${{ steps.manifest.outputs.subdomain }}
         run: |
           pip install requests --quiet
@@ -73,13 +74,16 @@ jobs:
           token   = os.environ["CF_API_TOKEN"]
           account = os.environ["CF_ACCOUNT_ID"]
           tunnel  = os.environ["CF_TUNNEL_ID"]
+          zone    = os.environ["CF_ZONE_ID"]
           host    = os.environ["SUBDOMAIN"]
           service = "http://traefik:80"
 
-          base    = f"https://api.cloudflare.com/client/v4/accounts/{account}/cfd_tunnel/{tunnel}/configurations"
           headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-          r = requests.get(base, headers=headers)
+          # ── 1. Update tunnel ingress rule ────────────────────────────────────
+          tunnel_base = f"https://api.cloudflare.com/client/v4/accounts/{account}/cfd_tunnel/{tunnel}/configurations"
+
+          r = requests.get(tunnel_base, headers=headers)
           r.raise_for_status()
           config  = r.json()["result"]["config"]
           ingress = config.get("ingress", [])
@@ -89,10 +93,34 @@ jobs:
           new_rule    = {"hostname": host, "service": service}
           new_ingress = [new_rule] + others + catch_all
 
-          r2 = requests.put(base, headers=headers,
+          r2 = requests.put(tunnel_base, headers=headers,
                json={"config": {**config, "ingress": new_ingress}})
           r2.raise_for_status()
           print(f"Tunnel ingress updated: {host} -> {service}")
+
+          # ── 2. Create/update DNS CNAME record ────────────────────────────────
+          dns_base   = f"https://api.cloudflare.com/client/v4/zones/{zone}/dns_records"
+          cname_data = {
+              "type":    "CNAME",
+              "name":    host,
+              "content": f"{tunnel}.cfargotunnel.com",
+              "proxied": True
+          }
+
+          r3 = requests.get(dns_base, headers=headers,
+               params={"name": host, "type": "CNAME"})
+          r3.raise_for_status()
+          records = r3.json().get("result", [])
+
+          if records:
+              record_id = records[0]["id"]
+              r4 = requests.put(f"{dns_base}/{record_id}", headers=headers, json=cname_data)
+              r4.raise_for_status()
+              print(f"DNS CNAME updated: {host} -> {cname_data['content']}")
+          else:
+              r4 = requests.post(dns_base, headers=headers, json=cname_data)
+              r4.raise_for_status()
+              print(f"DNS CNAME created: {host} -> {cname_data['content']}")
           EOF
 
       - name: Connect Tailscale
