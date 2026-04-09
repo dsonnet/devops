@@ -15,7 +15,8 @@ GitHub repo (any project)
         └── GitHub Actions (.github/workflows/deploy.yml)
               └── calls Smartoys/devops reusable workflow
                     ├── builds Docker image → pushes to ghcr.io/smartoys/<app>
-                    ├── adds Cloudflare Tunnel ingress rule via API
+                    ├── Cloudflare API → adds tunnel ingress rule
+                    ├── Cloudflare API → creates/updates DNS CNAME record
                     └── SSHs via Tailscale → deploy user → run.sh on server
                               └── docker compose up on dockerone VM
                                     └── Traefik picks up labels → routes traffic
@@ -37,22 +38,15 @@ GitHub repo (any project)
 
 ## What the operator must do manually (one-time per new project)
 
-Before the pipeline can route traffic, the operator must add a public hostname
-in Cloudflare. Tell them:
+**Nothing.** The pipeline is fully automated:
+- Builds and pushes the Docker image to GHCR
+- Adds the Cloudflare tunnel ingress rule via API
+- Creates or updates the DNS CNAME record via API
+- SSHes into dockerone and deploys the container
+- Traefik picks up routing automatically
 
-> "Please add a public hostname in Cloudflare Zero Trust:
-> - Dashboard: dash.cloudflare.com → Zero Trust → Networks → Tunnels →
->   your tunnel → Configure → Public Hostnames → Add
-> - Subdomain: `<app-name>`
-> - Domain: `kemushi.eu`
-> - Service Type: `HTTP`
-> - URL: `traefik`
-> - Save it.
->
-> This only needs to be done once per new subdomain."
-
-Everything else (image build, tunnel ingress API rule, SSH deploy, container
-start) is fully automated by the pipeline.
+The only optional human step is approving the GitHub Actions
+`production` environment gate if it is enabled.
 
 ---
 
@@ -265,7 +259,7 @@ Should return a valid HTTP 200 response from the container.
 | Pipeline fails at build step | Image name not lowercase | Ensure `app` in deploy.yml is all lowercase |
 | `invalid tag` GHCR error | Uppercase in image name | Fix app name to lowercase in deploy.yml |
 | Cloudflare tunnel step fails | Missing CF secrets | Check org secrets CF_API_TOKEN, CF_ACCOUNT_ID, CF_TUNNEL_ID |
-| Container starts but 404 | Cloudflare public hostname missing | Operator must add hostname in Zero Trust dashboard |
+| Container starts but 404 | DNS CNAME not yet propagated | Wait 30s and retry — pipeline creates it automatically |
 
 ---
 
@@ -292,8 +286,8 @@ bash /tmp/bootstrap-server.sh \
 4. Update the `DEPLOY_HOST` org secret with the new IP (or create a
    server-specific secret and update the reusable workflow to use it).
 
-5. Add a new Cloudflare Tunnel in Zero Trust and add public hostnames
-   for the apps that should run on the new server.
+5. Add a new Cloudflare Tunnel in Zero Trust. Public hostnames and DNS
+   CNAME records are created automatically by the pipeline on first deploy.
 
 ---
 
@@ -304,7 +298,6 @@ bash /tmp/bootstrap-server.sh \
 2. Create .github/workflows/deploy.yml at repo root
 3. Ensure Dockerfile exists at repo root
 4. Push to main
-5. Tell operator to add Cloudflare public hostname for <app>.kemushi.eu
-6. Approve the GitHub Actions production environment gate
-7. Verify with: curl https://<app>.kemushi.eu
+5. Approve the GitHub Actions production environment gate (if enabled)
+6. Verify with: curl https://<app>.kemushi.eu
 ```
